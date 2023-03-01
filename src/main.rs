@@ -12,15 +12,18 @@ async fn main() {
 
     let mut client = get_lnd_client(args).expect("failed to connect");
 
-    let info = client
-        .lightning()
-        .get_info(tonic_lnd::lnrpc::GetInfoRequest {})
-        .await
-        .expect("failed to get info");
+    let mut peer_stream = match block_on(
+        client
+            .lightning()
+            .subscribe_peer_events(tonic_lnd::lnrpc::PeerEventSubscription {}),
+    ) {
+        Ok(t) => t.into_inner(),
+        Err(e) => panic!("Could not get peer stream: {}", e),
+    };
 
-    // We only print it here, note that in real-life code you may want to call `.into_inner()` on
-    // the response to get the message.
-    println!("{:#?}", info);
+    while let Some(update) = peer_stream.message().await.expect("no peer events") {
+        println!("Peer event: {:?}", update);
+    }
 }
 
 fn get_lnd_client(cfg: LndCfg) -> Result<Client, ConnectError> {
