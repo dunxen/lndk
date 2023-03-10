@@ -25,7 +25,8 @@ use tokio::select;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tonic_lnd::{
     lnrpc::peer_event::EventType::PeerOffline, lnrpc::peer_event::EventType::PeerOnline,
-    lnrpc::NodeInfoRequest, lnrpc::PeerEvent, tonic::Status, Client, ConnectError,
+    lnrpc::NodeInfo, lnrpc::NodeInfoRequest, lnrpc::PeerEvent, tonic::Response, tonic::Status,
+    Client, ConnectError,
 };
 
 const ONION_MESSAGE_OPTIONAL: u32 = 39;
@@ -159,12 +160,49 @@ trait PeerEventProducer {
     fn onion_support(&mut self, pubkey: &PublicKey) -> Result<bool, ()>;
 }
 
+struct PeerStream<F: FnMut(&PublicKey) -> Result<Response<NodeInfo>, Status>> {
+    peer_subscription: tonic_lnd::tonic::Streaming<PeerEvent>,
+    node_info: F,
+}
+
+#[async_trait]
+impl<F: FnMut(&PublicKey) -> Result<Response<NodeInfo>, Status> + std::marker::Send>
+    PeerEventProducer for PeerStream<F>
+{
+    async fn receive(&mut self) -> Result<PeerEvent, Status> {
+        match self.peer_subscription.message().await? {
+            Some(peer_event) => Ok(peer_event),
+            None => Err(Status::unknown("no event provided")),
+        }
+    }
+
+    fn onion_support(&mut self, pubkey: &PublicKey) -> Result<bool, ()> {
+        let resp = (self.node_info)(pubkey)
+            .map_err(|_| {
+                error!("Could not lookup onion support for node: {pubkey}");
+            })?
+            .into_inner();
+
+        match resp.node {
+            Some(node) => Ok(node.features.contains_key(&ONION_MESSAGE_OPTIONAL)),
+            // If we couldn't find the node announcement, just assume that the node does not support onion messaging.
+            None => {
+                warn!(
+                    "Node {:?} not found in graph, assuming no onion message support",
+                    pubkey
+                );
+                Ok(false)
+            }
+        }
+    }
+}
+
 // Consumes a stream of peer online/offline events from the PeerEventProducer until the stream exits (by sending an
 // error) or the producer receives the signal to exit (via close of the exit channel).
-// 
-// Note that this function *must* send an exit error to the Sender provided on all exit-cases, so that upstream 
+//
+// Note that this function *must* send an exit error to the Sender provided on all exit-cases, so that upstream
 // consumers know to exit as well. Failures related to sending events are an exception, as failure to send indicates
-// that the consumer has already exited (the receiving end of the channel has hung up), and we can't send any more 
+// that the consumer has already exited (the receiving end of the channel has hung up), and we can't send any more
 // events anyway.
 async fn produce_peer_events(
     mut source: impl PeerEventProducer,
