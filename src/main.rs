@@ -273,6 +273,22 @@ trait IncomingMessageProducer {
     fn receive(&mut self) -> Result<CustomMessage, Status>;
 }
 
+struct MessageStream {
+    message_subscription: tonic_lnd::tonic::Streaming<CustomMessage>,
+}
+
+impl IncomingMessageProducer for MessageStream {
+    fn receive(&mut self) -> Result<CustomMessage, Status> {
+        match block_on(self.message_subscription.message()) {
+            Ok(event) => match event {
+                Some(message) => Ok(message),
+                None => Err(Status::unknown("no event provided")),
+            },
+            Err(e) => Err(Status::unknown(format!("streaming error: {e}"))),
+        }
+    }
+}
+
 fn produce_incoming_message_events(
     mut source: impl IncomingMessageProducer,
     events: Sender<MessengerEvents>,
