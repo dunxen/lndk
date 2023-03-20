@@ -5,7 +5,7 @@ use bitcoin::secp256k1::{self, PublicKey, Scalar, Secp256k1};
 use futures::executor::block_on;
 use lightning::chain::keysinterface::{EntropySource, KeyMaterial, NodeSigner, Recipient};
 use lightning::ln::features::InitFeatures;
-use lightning::ln::msgs::{Init, OnionMessageHandler, UnsignedGossipMessage};
+use lightning::ln::msgs::{Init, OnionMessage, OnionMessageHandler, UnsignedGossipMessage};
 use lightning::ln::peer_handler::IgnoringMessageHandler;
 use lightning::onion_message::{CustomOnionMessageHandler, OnionMessenger};
 use lightning::util::logger::{Level, Logger, Record};
@@ -228,7 +228,7 @@ fn produce_peer_events(
                     match source.onion_support(&pubkey) {
                         Ok(onion_support) => {
                             let event = MessengerEvents::PeerConnected(pubkey, onion_support);
-                            match events.send(event) {
+                            match events.send(event.clone()) {
                                 Ok(_) => debug!("peer events sent: {event}"),
                                 Err(err) => return Err(ProducerError::SendError(err)),
                             };
@@ -245,7 +245,7 @@ fn produce_peer_events(
                     let event = MessengerEvents::PeerDisconnected(
                         PublicKey::from_str(&peer_event.pub_key).unwrap(),
                     );
-                    match events.send(event) {
+                    match events.send(event.clone()) {
                         Ok(_) => debug!("peer events sent: {event}"),
                         Err(err) => return Err(ProducerError::SendError(err)),
                     };
@@ -255,7 +255,7 @@ fn produce_peer_events(
                 info!("peer events receive failed: {s}");
 
                 let event = MessengerEvents::ProducerExit(ConsumerError::PeerProducerExit);
-                match events.send(event) {
+                match events.send(event.clone()) {
                     Ok(_) => debug!("peer events sent: {event}"),
                     Err(err) => error!("peer events: send producer exit failed: {err}"),
                 }
@@ -273,6 +273,9 @@ enum ConsumerError {
 
     // The producer responsible for peer connection events has exited.
     PeerProducerExit,
+
+    // The producer responsible for incoming onion messages has exited.
+    MessageProducerExit,
 }
 
 impl Error for ConsumerError {}
@@ -284,15 +287,17 @@ impl fmt::Display for ConsumerError {
                 write!(f, "consumer err: onion messenger failure")
             }
             ConsumerError::PeerProducerExit => write!(f, "consumer err: peer producer exit"),
+            ConsumerError::MessageProducerExit => write!(f, "consumer err: message producer exit"),
         }
     }
 }
 
 // MessengerEvents represents all of the events that are relevant to onion messages.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 enum MessengerEvents {
     PeerConnected(PublicKey, bool),
     PeerDisconnected(PublicKey),
+    IncomingMessage(PublicKey, OnionMessage),
     ProducerExit(ConsumerError),
 }
 
@@ -306,6 +311,9 @@ impl fmt::Display for MessengerEvents {
                 )
             }
             MessengerEvents::PeerDisconnected(p) => write!(f, "messenger event: {p} disconnected"),
+            MessengerEvents::IncomingMessage(p, _) => {
+                write!(f, "messenger event: onion message from: {p}")
+            }
             MessengerEvents::ProducerExit(s) => write!(f, "messenger event: {s} exited"),
         }
     }
@@ -318,37 +326,42 @@ fn consume_messenger_events(
 ) -> Result<(), ConsumerError> {
     loop {
         match events.recv() {
-            Ok(onion_event) => match onion_event {
-                MessengerEvents::PeerConnected(pubkey, onion_support) => {
-                    info!("Consume messenger events received: {onion_event}");
+            Ok(onion_event) => {
+                info!("Consume messenger events received: {}", onion_event.clone());
 
-                    let init_features = if onion_support {
-                        let onion_message_optional: u64 = 1 << ONION_MESSAGE_OPTIONAL;
-                        InitFeatures::from_le_bytes(onion_message_optional.to_le_bytes().to_vec())
-                    } else {
-                        InitFeatures::empty()
-                    };
+                match onion_event {
+                    MessengerEvents::PeerConnected(pubkey, onion_support) => {
+                        let init_features = if onion_support {
+                            let onion_message_optional: u64 = 1 << ONION_MESSAGE_OPTIONAL;
+                            InitFeatures::from_le_bytes(
+                                onion_message_optional.to_le_bytes().to_vec(),
+                            )
+                        } else {
+                            InitFeatures::empty()
+                        };
 
-                    onion_messenger
-                        .peer_connected(
-                            &pubkey,
-                            &Init {
-                                features: init_features,
-                                remote_network_address: None,
-                            },
-                            false,
-                        )
-                        .map_err(|_| ConsumerError::OnionMessengerFailure)?
-                }
-                MessengerEvents::PeerDisconnected(pubkey) => {
-                    info!("Consume messenger events received: {onion_event}");
-                    onion_messenger.peer_disconnected(&pubkey)
-                }
-                MessengerEvents::ProducerExit(e) => {
-                    info!("Consume messenger events received: {onion_event}");
-                    return Err(e);
-                }
-            },
+                        onion_messenger
+                            .peer_connected(
+                                &pubkey,
+                                &Init {
+                                    features: init_features,
+                                    remote_network_address: None,
+                                },
+                                false,
+                            )
+                            .map_err(|_| ConsumerError::OnionMessengerFailure)?
+                    }
+                    MessengerEvents::PeerDisconnected(pubkey) => {
+                        onion_messenger.peer_disconnected(&pubkey)
+                    }
+                    MessengerEvents::IncomingMessage(pubkey, message) => {
+                        onion_messenger.handle_onion_message(&pubkey, &message);
+                    }
+                    MessengerEvents::ProducerExit(e) => {
+                        return Err(e);
+                    }
+                };
+            }
             // If our receiver exits, there are no more events to consume so we can exit cleanly.
             Err(e) => {
                 info!("Consumer messenger events received: {e}");
@@ -555,11 +568,14 @@ mod tests {
     use super::*;
 
     use bitcoin::secp256k1::PublicKey;
+    use bytes::BufMut;
     use hex;
     use lightning::ln::features::{InitFeatures, NodeFeatures};
     use lightning::ln::msgs::{OnionMessage, OnionMessageHandler};
     use lightning::util::events::OnionMessageProvider;
+    use lightning::util::ser::Readable;
     use mockall::mock;
+    use std::io::Cursor;
     use std::sync::mpsc::channel;
 
     fn pubkey() -> PublicKey {
@@ -568,6 +584,33 @@ mod tests {
                 .unwrap()[..],
         )
         .unwrap()
+    }
+
+    // onion_message produces an OnionMessage that can be used for tests. We need to manually write
+    // individual bytes because onion messages in LDK can only be created using read/write impls that
+    // deal with raw bytes (since some other fields are not public).
+    fn onion_message() -> OnionMessage {
+        let mut w = vec![];
+        let pubkey_bytes = pubkey().serialize();
+
+        // Blinding point for the onion message.
+        w.put_slice(&pubkey_bytes);
+
+        // Write the length of the onion packet:
+        // Version: 1
+        // Ephemeral Key: 33
+        // Hop Payloads: 100
+        // HMAC: 32.
+        w.put_u16(1 + 33 + 1300 + 32);
+
+        // Write meaningless contents for the actual values.
+        w.put_u8(0);
+        w.put_slice(&pubkey_bytes);
+        w.put_bytes(1, 1300);
+        w.put_bytes(2, 32);
+
+        let mut readable = Cursor::new(w);
+        OnionMessage::read(&mut readable).unwrap()
     }
 
     mock! {
@@ -623,6 +666,13 @@ mod tests {
         // Cover peer disconnected events.
         sender.send(MessengerEvents::PeerDisconnected(pk)).unwrap();
         mock.expect_peer_disconnected().return_once(|_| ());
+
+        // Cover incoming onion messages.
+        let onion_message = onion_message();
+        sender
+            .send(MessengerEvents::IncomingMessage(pk, onion_message))
+            .unwrap();
+        mock.expect_handle_onion_message().return_once(|_, _| ());
 
         // Finally, send a producer exit event to test exit.
         sender
