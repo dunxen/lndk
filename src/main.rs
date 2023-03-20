@@ -9,6 +9,7 @@ use lightning::ln::msgs::{Init, OnionMessage, OnionMessageHandler, UnsignedGossi
 use lightning::ln::peer_handler::IgnoringMessageHandler;
 use lightning::onion_message::{CustomOnionMessageHandler, OnionMessenger};
 use lightning::util::logger::{Level, Logger, Record};
+use lightning::util::ser::Readable;
 use log::{debug, error, info, trace, warn};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
@@ -16,6 +17,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::io::Cursor;
 use std::marker::Copy;
 use std::ops::Deref;
 use std::str::FromStr;
@@ -23,11 +25,12 @@ use std::sync::mpsc::{channel, Receiver, SendError, Sender};
 use std::thread;
 use tonic_lnd::{
     lnrpc::peer_event::EventType::PeerOffline, lnrpc::peer_event::EventType::PeerOnline,
-    lnrpc::NodeInfo, lnrpc::NodeInfoRequest, lnrpc::PeerEvent, tonic::Response, tonic::Status,
-    Client, ConnectError,
+    lnrpc::CustomMessage, lnrpc::NodeInfo, lnrpc::NodeInfoRequest, lnrpc::PeerEvent,
+    tonic::Response, tonic::Status, Client, ConnectError,
 };
 
 const ONION_MESSAGE_OPTIONAL: u32 = 39;
+const ONION_MESSAGE_TYPE: u32 = 513;
 
 #[tokio::main]
 async fn main() -> Result<(), ()> {
@@ -258,6 +261,51 @@ fn produce_peer_events(
                 match events.send(event.clone()) {
                     Ok(_) => debug!("peer events sent: {event}"),
                     Err(err) => error!("peer events: send producer exit failed: {err}"),
+                }
+
+                return Err(ProducerError::StreamError(event));
+            }
+        }
+    }
+}
+
+trait IncomingMessageProducer {
+    fn receive(&mut self) -> Result<CustomMessage, Status>;
+}
+
+fn produce_incoming_message_events(
+    mut source: impl IncomingMessageProducer,
+    events: Sender<MessengerEvents>,
+) -> Result<(), ProducerError> {
+    loop {
+        match source.receive() {
+            Ok(incoming_message) => {
+                if incoming_message.r#type != ONION_MESSAGE_TYPE {
+                    trace!("Ignoring custom message: {}", incoming_message.r#type);
+                    continue;
+                }
+
+                let pubkey = PublicKey::from_slice(&incoming_message.peer).unwrap();
+                match OnionMessage::read(&mut Cursor::new(incoming_message.data)) {
+                    Ok(onion_message) => {
+                        let event = MessengerEvents::IncomingMessage(pubkey, onion_message);
+                        match events.send(event.clone()) {
+                            Ok(_) => debug!("Incoming messages send: {event}"),
+                            Err(err) => return Err(ProducerError::SendError(err)),
+                        };
+                    }
+                    Err(e) => {
+                        error!("Invalid onion message from: {pubkey}: {e}");
+                    }
+                }
+            }
+            Err(s) => {
+                info!("incoming message events receive failed: {s}");
+
+                let event = MessengerEvents::ProducerExit(ConsumerError::MessageProducerExit);
+                match events.send(event.clone()) {
+                    Ok(_) => debug!("incoming message events sent: {event}"),
+                    Err(err) => error!("incoming message events: send producer exit failed: {err}"),
                 }
 
                 return Err(ProducerError::StreamError(event));
@@ -573,7 +621,7 @@ mod tests {
     use lightning::ln::features::{InitFeatures, NodeFeatures};
     use lightning::ln::msgs::{OnionMessage, OnionMessageHandler};
     use lightning::util::events::OnionMessageProvider;
-    use lightning::util::ser::Readable;
+    use lightning::util::ser::{Readable, Writeable};
     use mockall::mock;
     use std::io::Cursor;
     use std::sync::mpsc::channel;
@@ -635,6 +683,14 @@ mod tests {
         impl PeerEventProducer for PeerProducer{
             fn receive(&mut self) -> Result<PeerEvent, Status>;
             fn onion_support(&mut self, pubkey: &PublicKey) -> Result<bool, Box<dyn Error>>;
+        }
+    }
+
+    mock! {
+        MessageProducer{}
+
+        impl IncomingMessageProducer for MessageProducer {
+            fn receive(&mut self) -> Result<CustomMessage, Status>;
         }
     }
 
@@ -764,6 +820,50 @@ mod tests {
         matches!(
             receiver.recv().unwrap(),
             MessengerEvents::PeerDisconnected(_)
+        );
+
+        matches!(receiver.recv().unwrap(), MessengerEvents::ProducerExit(_));
+    }
+
+    #[test]
+    fn test_produce_incoming_message_events() {
+        let (sender, receiver) = channel();
+
+        let mut mock = MockMessageProducer::new();
+
+        // Send a custom message that is not relevant to us.
+        mock.expect_receive().times(1).returning(|| {
+            Ok(CustomMessage {
+                peer: pubkey().serialize().to_vec(),
+                r#type: 3,
+                data: vec![1, 2, 3],
+            })
+        });
+
+        // Send a custom message that is an onion message.
+        mock.expect_receive().times(1).returning(|| {
+            let mut w = vec![];
+            onion_message().write(&mut w).unwrap();
+
+            Ok(CustomMessage {
+                peer: pubkey().serialize().to_vec(),
+                r#type: ONION_MESSAGE_TYPE,
+                data: w,
+            })
+        });
+
+        mock.expect_receive()
+            .times(1)
+            .returning(|| Err(Status::unknown("mock stream err")));
+
+        matches!(
+            produce_incoming_message_events(mock, sender).expect_err("producer should error"),
+            ProducerError::StreamError(_),
+        );
+
+        matches!(
+            receiver.recv().unwrap(),
+            MessengerEvents::IncomingMessage(_, _),
         );
 
         matches!(receiver.recv().unwrap(), MessengerEvents::ProducerExit(_));
