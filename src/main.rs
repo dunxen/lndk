@@ -128,6 +128,7 @@ where
     // up creating some duplicate events. The event subscription from LND blocks until it gets its first event (which
     // could take very long), so we get the subscription itself inside of our producer thread.
     let mut peers_client = ln_client.clone();
+    let peers_sender = sender.clone();
     let peer_events_handler = thread::spawn(move || {
         let peer_subscription = block_on(
             peers_client.subscribe_peer_events(tonic_lnd::lnrpc::PeerEventSubscription {}),
@@ -147,10 +148,31 @@ where
                 peer_subscription,
                 node_info,
             },
-            sender,
+            peers_sender,
         ) {
             Ok(_) => debug!("Peer events producer exited"),
             Err(e) => error!("Peer events producer exited: {e}"),
+        };
+    });
+
+    let mut message_client = ln_client.clone();
+    let messages_sender = sender.clone();
+    let messsage_events_handler = thread::spawn(move || {
+        let message_subscription = block_on(
+            message_client
+                .subscribe_custom_messages(tonic_lnd::lnrpc::SubscribeCustomMessagesRequest {}),
+        )
+        .expect("message subscriptioned failed")
+        .into_inner();
+
+        match produce_incoming_message_events(
+            MessageStream {
+                message_subscription,
+            },
+            messages_sender,
+        ) {
+            Ok(_) => debug!("Message events producer exited"),
+            Err(e) => error!("Message events producer exited: {e}"),
         };
     });
 
@@ -158,9 +180,16 @@ where
         error!("run onion messenger: {e}");
     })?;
 
+    // TODO: these could exit in any order, and may not all exit when  consume_messenger_events is done, need
+    // to handle this pattern (eg: message_events_handler exits, which causes consume_messenger_events to exit
+    // -> peer_events handler is not going to exit, need to explicitly signal this).
     peer_events_handler
         .join()
-        .map_err(|e| debug!("peer events: {:?}", e))
+        .map_err(|e| debug!("peer events: {:?}", e))?;
+
+    messsage_events_handler
+        .join()
+        .map_err(|e| debug!("message events: {:?}", e))
 }
 
 #[derive(Debug)]
