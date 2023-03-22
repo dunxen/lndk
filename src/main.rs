@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::marker::Copy;
+use std::marker::Copy; 
 use std::ops::Deref;
 use std::str::FromStr;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -130,8 +130,11 @@ where
     // could take very long), so we get the subscription itself inside of our producer thread.
     let mut peers_client = ln_client.clone();
     let peer_events_handler = tokio::spawn(async move {
-        let peer_subscription =
-            peers_client.subscribe_peer_events(tonic_lnd::lnrpc::PeerEventSubscription {});
+        let peer_subscription = peers_client
+            .subscribe_peer_events(tonic_lnd::lnrpc::PeerEventSubscription {})
+            .await
+            .expect("peer subscription failed")
+            .into_inner();
 
         let node_info = |pubkey: &PublicKey| -> Result<Response<NodeInfo>, Status> {
             block_on(peers_client.get_node_info(NodeInfoRequest {
@@ -141,10 +144,7 @@ where
         };
 
         let peer_stream = PeerStream {
-            peer_subscription: peer_subscription
-                .await
-                .expect("peer subscription failed")
-                .into_inner(),
+            peer_subscription,
             node_info,
         };
 
@@ -186,7 +186,7 @@ impl fmt::Display for ProducerError {
 #[async_trait]
 trait PeerEventProducer {
     async fn receive(&mut self) -> Result<PeerEvent, Status>;
-    fn onion_support(&mut self, pubkey: &PublicKey) -> Result<bool, Box<dyn Error>>;
+    fn onion_support(&mut self, pubkey: &PublicKey) -> Result<bool, ()>;
 }
 
 struct PeerStream<F: FnMut(&PublicKey) -> Result<Response<NodeInfo>, Status>> {
@@ -208,8 +208,11 @@ impl<F: FnMut(&PublicKey) -> Result<Response<NodeInfo>, Status> + std::marker::S
         }
     }
 
-    fn onion_support(&mut self, pubkey: &PublicKey) -> Result<bool, Box<dyn Error>> {
-        let resp = (self.node_info)(pubkey)?.into_inner();
+    fn onion_support(&mut self, pubkey: &PublicKey) -> Result<bool, ()> {
+        let resp = (self.node_info)(pubkey).map_err(|_| {
+			error!("Could not lookup onion support for node: {pubkey}");
+		})?.into_inner();
+
         match resp.node {
             Some(node) => Ok(node.features.contains_key(&ONION_MESSAGE_OPTIONAL)),
             // If we couldn't find the node announcement, just assume that the node does not support onion messaging.
@@ -233,7 +236,8 @@ async fn produce_peer_events(
             Ok(peer_event) => match peer_event.r#type() {
                 PeerOnline => {
                     let pubkey = PublicKey::from_str(&peer_event.pub_key).unwrap();
-                    match source.onion_support(&pubkey) {
+                    let onion_support = source.onion_support(&pubkey);
+                    match onion_support {
                         Ok(onion_support) => {
                             let event = MessengerEvents::PeerConnected(pubkey, onion_support);
                             match events.send(event).await {
@@ -243,8 +247,8 @@ async fn produce_peer_events(
                         }
                         // If we couldn't lookup the peer's onion message support, just log the error and ignore the
                         // connection event.
-                        Err(e) => {
-                            warn!("onion support lookup failed for {pubkey}: {e}, ignoring connection event");
+                        Err(_) => {
+                            warn!("onion support lookup failed for {pubkey}, ignoring connection event");
                             continue;
                         }
                     };
@@ -594,7 +598,7 @@ mod tests {
         #[async_trait]
         impl PeerEventProducer for PeerProducer{
             async fn receive(&mut self) -> Result<PeerEvent, Status>;
-            fn onion_support(&mut self, pubkey: &PublicKey) -> Result<bool, Box<dyn Error>>;
+            fn onion_support(&mut self, pubkey: &PublicKey) -> Result<bool, ()>;
         }
     }
 
@@ -688,7 +692,7 @@ mod tests {
             })
         });
         mock.expect_onion_support()
-            .returning(|_| Err(Box::new(ConsumerError::PeerProducerExit)));
+            .returning(|_| Err(()));
 
         // Peer disconnects.
         mock.expect_receive().times(1).returning(|| {
